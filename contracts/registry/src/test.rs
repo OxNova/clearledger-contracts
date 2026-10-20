@@ -3,8 +3,8 @@
 extern crate std;
 
 use crate::{
-    DataKey, Profile, RegistryContract, RegistryContractClient, Role, VerificationStatus,
-    TTL_EXTEND_TO, TTL_THRESHOLD,
+    DataKey, Profile, RegistryContract, RegistryContractClient, RegistryError, Role,
+    VerificationStatus, TTL_EXTEND_TO, TTL_THRESHOLD,
 };
 use proptest::prelude::*;
 use proptest::test_runner::{Config as ProptestConfig, TestRunner};
@@ -14,7 +14,7 @@ use soroban_sdk::{
         storage::{Instance as _, Persistent as _},
         Address as _, Events as _, Ledger,
     },
-    vec, Address, Env, IntoVal, String, Symbol, TryFromVal, TryIntoVal, Val, Vec,
+    vec, Address, Env, Error, IntoVal, String, Symbol, TryFromVal, TryIntoVal, Val, Vec,
 };
 
 fn setup() -> (Env, RegistryContractClient<'static>) {
@@ -2536,4 +2536,238 @@ fn test_pause_is_scoped_to_one_instance() {
     let issuer = Address::generate(&env);
     assert!(a.try_register_issuer(&issuer, &map![&env]).is_err());
     assert!(b.register_issuer(&issuer, &map![&env]));
+}
+
+const ENUMERATION_POOL_SIZE: usize = 10;
+const ENUMERATION_MAX_OPS: usize = 24;
+
+const OP_REGISTER: u8 = 0;
+const OP_DUPLICATE: u8 = 1;
+const OP_BATCH: u8 = 2;
+const OP_REVOKE: u8 = 3;
+const OP_REINSTATE: u8 = 4;
+
+type EnumerationOpPlan = std::vec::Vec<(u8, usize, usize, usize)>;
+
+fn enumeration_op_plan() -> impl Strategy<Value = EnumerationOpPlan> {
+    prop::collection::vec(
+        (
+            0u8..5,
+            0usize..ENUMERATION_POOL_SIZE,
+            0usize..ENUMERATION_POOL_SIZE,
+            0usize..ENUMERATION_POOL_SIZE,
+        ),
+        1..=ENUMERATION_MAX_OPS,
+    )
+}
+
+fn register_for_role(
+    env: &Env,
+    client: &RegistryContractClient<'static>,
+    is_buyer: bool,
+    address: &Address,
+) {
+    if is_buyer {
+        client.register_buyer(address, &map![env]);
+    } else {
+        client.register_issuer(address, &map![env]);
+    }
+}
+
+fn batch_register_for_role(
+    client: &RegistryContractClient<'static>,
+    is_buyer: bool,
+    entries: &Vec<(Address, soroban_sdk::Map<String, String>)>,
+) -> Vec<Address> {
+    if is_buyer {
+        client.batch_register_buyers(entries)
+    } else {
+        client.batch_register_issuers(entries)
+    }
+}
+
+fn contract_error(code: u32) -> Result<Error, soroban_sdk::InvokeError> {
+    Ok(Error::from_contract_error(code))
+}
+
+fn assert_duplicate_register_rejected(
+    env: &Env,
+    client: &RegistryContractClient<'static>,
+    is_buyer: bool,
+    address: &Address,
+) {
+    let result = if is_buyer {
+        client.try_register_buyer(address, &map![env])
+    } else {
+        client.try_register_issuer(address, &map![env])
+    };
+    assert_eq!(result.unwrap_err(), contract_error(RegistryError::AlreadyRegistered as u32));
+}
+
+fn assert_enumeration_matches(
+    client: &RegistryContractClient<'static>,
+    role: &Role,
+    expected: &[Address],
+    page_size: u32,
+) {
+    assert!((1u32..=50).contains(&page_size));
+    let count = expected.len() as u32;
+    let mut start: u32 = 0;
+    let mut seen: usize = 0;
+    loop {
+        let page = client.list_profiles(role, &start, &page_size);
+        assert!(page.len() <= page_size);
+        assert_eq!(page, client.list_profiles(role, &start, &page_size));
+        let expected_len = (count.saturating_sub(start) as usize).min(page_size as usize);
+        assert_eq!(page.len() as usize, expected_len);
+        for i in 0..page.len() {
+            assert_eq!(page.get(i).unwrap(), expected[seen]);
+            seen += 1;
+        }
+
+        start = start.saturating_add(page_size);
+        if page.len() < page_size {
+            break;
+        }
+    }
+    assert_eq!(seen, expected.len());
+}
+
+fn run_enumeration_prop_test(is_buyer: bool) {
+    let mut runner = TestRunner::new(ProptestConfig::with_cases(10));
+    runner
+        .run(
+            &(enumeration_op_plan(), 1u32..=50, 1u32..=50),
+            |(ops, page_size_a, page_size_b)| {
+                let (env, client) = setup();
+                let admin = Address::generate(&env);
+                client.initialize(&admin);
+                let role = if is_buyer { Role::Buyer } else { Role::Issuer };
+
+                let addresses: std::vec::Vec<Address> = (0..ENUMERATION_POOL_SIZE)
+                    .map(|_| Address::generate(&env))
+                    .collect();
+
+                let mut registered = std::vec![false; ENUMERATION_POOL_SIZE];
+                let mut expected: std::vec::Vec<Address> = std::vec::Vec::new();
+
+                for &(action, a, b, c) in ops.iter() {
+                    match action {
+                        OP_REGISTER => {
+                            let address = addresses[a].clone();
+                            if registered[a] {
+                                assert_duplicate_register_rejected(
+                                    &env,
+                                    &client,
+                                    is_buyer,
+                                    &address,
+                                );
+                            } else {
+                                register_for_role(&env, &client, is_buyer, &address);
+                                registered[a] = true;
+                                expected.push(address);
+                            }
+                        }
+                        OP_DUPLICATE => {
+                            let address = addresses[a].clone();
+                            if !registered[a] {
+                                register_for_role(&env, &client, is_buyer, &address);
+                                registered[a] = true;
+                                expected.push(address.clone());
+                            }
+                            assert_duplicate_register_rejected(&env, &client, is_buyer, &address);
+                        }
+                        OP_BATCH => {
+                            let indices = [a, b, c];
+                            let mut entries = Vec::new(&env);
+                            for index in indices.iter() {
+                                entries.push_back((addresses[*index].clone(), map![&env]));
+                            }
+                            let skipped = batch_register_for_role(&client, is_buyer, &entries);
+
+                            let mut seen_in_batch = std::collections::BTreeSet::new();
+                            let mut expected_skipped = Vec::new(&env);
+                            for index in indices.iter() {
+                                if registered[*index] || seen_in_batch.contains(index) {
+                                    expected_skipped.push_back(addresses[*index].clone());
+                                } else {
+                                    seen_in_batch.insert(*index);
+                                    registered[*index] = true;
+                                    expected.push(addresses[*index].clone());
+                                }
+                            }
+                            assert_eq!(skipped, expected_skipped);
+                        }
+                        OP_REVOKE => {
+                            let address = addresses[a].clone();
+                            if registered[a] {
+                                client.verify_profile(&address, &true);
+                                client.revoke(&address);
+                                assert!(!client.is_verified(&address));
+                                assert_eq!(
+                                    client.get_verification_status(&address),
+                                    VerificationStatus::Revoked
+                                );
+                                assert_eq!(client.get_profile_count(&role), expected.len() as u32);
+                            } else {
+                                assert_eq!(
+                                    client.try_revoke(&address).unwrap_err(),
+                                    contract_error(RegistryError::NotFound as u32)
+                                );
+                            }
+                        }
+                        OP_REINSTATE => {
+                            let address = addresses[a].clone();
+                            if registered[a] {
+                                client.reinstate(&address);
+                                assert_eq!(
+                                    client.get_verification_status(&address),
+                                    VerificationStatus::Verified
+                                );
+                            } else {
+                                assert_eq!(
+                                    client.try_reinstate(&address).unwrap_err(),
+                                    contract_error(RegistryError::NotFound as u32)
+                                );
+                            }
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+
+                assert_eq!(client.get_profile_count(&role), expected.len() as u32);
+
+                assert_enumeration_matches(&client, &role, &expected, 1);
+                assert_enumeration_matches(&client, &role, &expected, 50);
+                assert_enumeration_matches(&client, &role, &expected, page_size_a);
+                assert_enumeration_matches(&client, &role, &expected, page_size_b);
+
+                assert_eq!(client.list_profiles(&role, &0, &0).len(), 0);
+                assert_eq!(
+                    client.list_profiles(&role, &(expected.len() as u32 + 1), &25).len(),
+                    0
+                );
+                assert_eq!(client.list_profiles(&role, &u32::MAX, &50).len(), 0);
+
+                for invalid_limit in [51u32, 100, u32::MAX] {
+                    assert_eq!(
+                        client.try_list_profiles(&role, &0, &invalid_limit).unwrap_err(),
+                        contract_error(RegistryError::PageSizeExceeded as u32)
+                    );
+                }
+
+                Ok(())
+            },
+        )
+        .unwrap();
+}
+
+#[test]
+fn prop_issuer_enumeration_unique_stable_and_registration_ordered() {
+    run_enumeration_prop_test(false);
+}
+
+#[test]
+fn prop_buyer_enumeration_unique_stable_and_registration_ordered() {
+    run_enumeration_prop_test(true);
 }
